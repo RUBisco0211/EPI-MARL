@@ -1,0 +1,6 @@
+.vscode
+
+*.pyc
+*.pyi
+trained_model
+.DS_Store
