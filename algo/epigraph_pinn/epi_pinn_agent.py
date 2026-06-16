@@ -17,7 +17,6 @@ import torch.nn.functional as F
 from algo.utils import *
 
 
-
 def c_cost(x, s=20.0):
     """
     x : tensor shape (B, 4)  with ordering [x1, v1, x2, v2]
@@ -25,6 +24,7 @@ def c_cost(x, s=20.0):
     """
     x1 = x[:, 0:1]
     x2 = x[:, 2:3]
+    # NOTE: 平滑的符号约束代理 c(x)，用于示例中的排序约束。
     raw = x1 - x2 + 0.02                  # small shift to keep it smooth/differentiable
     sigmoid = torch.sigmoid(s * raw)      # σ(s·raw)
     c_val = 2.0 * sigmoid - 1.0           # map to (-1, 1)
@@ -46,6 +46,7 @@ def smooth_violation_sigmoid(x, margin=0.002, scale=40.0):
     """
     x1 = x[:, 0:1]
     x2 = x[:, 2:3]
+    # NOTE: 可微的约束违反代理；正值表示越过安全边界。
     raw = scale * (x1 - x2 + margin)
     sig = torch.sigmoid(raw)              # ∈ (0,1)
     return sig * (1 + 1e-3) - 1e-3        # ∈ (-1e-3, 1)
@@ -77,6 +78,7 @@ def smooth_violation_spread(x_flat: torch.Tensor,
     d = d.masked_fill(eye, radius*2+delta*2)                           # make s negative on diagonal (safe)
 
     # Signed gap s: >0 means violation (contact/overlap), <=0 means safe
+    # NOTE: MPE 中两两智能体的安全间隔 c_ij(x)；发生重叠时约束违反为正。
     s = (2.0 * radius + delta) - d                                     # [B,N,N]
 
     # Piecewise scaling: amplify s>0 by 10x; keep s<=0 as negative
@@ -109,6 +111,7 @@ def smooth_violation_spread(x_flat: torch.Tensor,
 
 def f_wrapper(x, u, dt, net):
     """Return dx/dt prediction so Jacobian is w.r.t. derivative."""
+    # NOTE: 由学习到的一步预测模型估计连续时间动力学 f(x,u)。
     return (net(x, u, dt) - x) / dt          # [B, ND]
 
 # from functorch import jacrev  # torch >=1.13, or use functorch
@@ -322,15 +325,17 @@ class epi_agent_new:
             u_t     = actions.view(B, -1)         # [B, N*A]
             x_tp1   = next_states.view(B, -1)
             dt      = dt.view(B, -1)
+            # NOTE: 学习到的动力学模型根据集中状态、联合动作和 dt 预测 x_{t+dt}。
             x_next_pred  = self.dynamics_nets[i](x_t, u_t, dt)                  # [B, N*D]
 
+            # NOTE: 动力学拟合损失约束 F_theta(x_t,u_t,dt) 接近 x_{t+dt}。
             loss  = nn.MSELoss()(x_next_pred , x_tp1)  # [B, N*D]
             self.dynamics_optimizers[i].zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.dynamics_nets[i].parameters(), 1.0)
             self.dynamics_optimizers[i].step()
         return loss.item()
-    
+
     def compute_z_star(self, x, i, alpha=1.0, bias=0.0):
         """
         Semantics:
@@ -344,6 +349,7 @@ class epi_agent_new:
             Vl = self.value_nets[i](x)   # performance/return value (make sure this is actually return-to-go)
             Vh_pos = torch.relu(Vh)      # keep only positive violation part
 
+            # NOTE: 本实现使用的启发式 z*，用于平衡回报分支和约束分支。
             z_star = Vl + alpha * Vh_pos + self.args.z_bias
 
             # z_star = z_star.clamp(min=self.z_min, max=self.z_max)
@@ -363,10 +369,12 @@ class epi_agent_new:
             c_val = c_vals[:,i].view(B, -1)
             reversed_vals = torch.flip(c_val, dims=[0])            # ***dim=0***
             suffix_max_rev, _ = torch.cummax(reversed_vals, dim=0) # ***dim=0***
+            # NOTE: 约束 critic 的目标是未来最坏约束违反 sup_{tau>=t} c(x_tau)。
             c_max = torch.flip(suffix_max_rev, dims=[0]).view(B, -1)   # [B, N] / [B, 1]
             # reverse along time dimension
 
             pred_c = self.cost_nets[i](states).view(B, -1)
+            # NOTE: 训练 V_cons(x_t) 逼近后缀最大约束目标。
             loss = nn.MSELoss()(pred_c, c_max)
 
             self.cost_nets[i].zero_grad()
@@ -374,7 +382,7 @@ class epi_agent_new:
             loss.backward()
             self.cost_optimizers[i].step()  # reuse optimizer or create one
         return loss.item()
-    
+
     def single_cost_training(self, batch):
         FloatTensor = torch.cuda.FloatTensor if self.use_cuda else torch.FloatTensor
         states, actions, next_states, rewards, dt, returns, c_vals ,z = batch
@@ -390,7 +398,9 @@ class epi_agent_new:
             u_t = actions.view(B, -1)                         # [B, N*A]
             c_val = c_vals[:,i].view(B, -1)
             dt = dt.view(B, -1)
+            # NOTE: 学习到的即时约束模型 c_hat(x,u,dt) 为 VGI 和 actor 更新提供梯度。
             c_hat = self.single_cost_net[i](x_t, u_t, dt).view(B, -1)  # [B, N] or [B]
+            # NOTE: 拟合环境返回的即时连续约束信号。
             loss = nn.MSELoss()(c_hat, c_val)
 
             self.single_cost_optimizers[i].zero_grad()
@@ -419,10 +429,12 @@ class epi_agent_new:
         int_returns = -returns  # for monitoring only
 
         log_gamma = torch.log(torch.as_tensor(self.args.gamma, device=dt.device, dtype=dt.dtype))
+        # NOTE: 不规则时间间隔下的连续时间折扣因子 gamma^dt。
         gamma_dt  = torch.exp(log_gamma * dt)          # [B,1]
         for i in range(self.n_agents):
             per_return = int_returns[:, i].view(B, -1)  # [B,1] for agent i
             V_now = self.value_nets[i](x_t)
+            # NOTE: 回报 critic 的目标是轨迹上的蒙特卡洛折扣累计代价。
             loss  = F.mse_loss(V_now, per_return)
 
             self.value_optimizers[i].zero_grad()
@@ -431,7 +443,6 @@ class epi_agent_new:
             self.value_optimizers[i].step()
 
         return loss.item()
-
 
     def tilde_value_training(self, batch):
         FloatTensor = torch.cuda.FloatTensor if self.use_cuda else torch.FloatTensor
@@ -454,6 +465,7 @@ class epi_agent_new:
             x_tp1 = torch.stack(next_states).type(FloatTensor).view(B, -1)  # [B, N*D]
             reversed_vals = torch.flip(c_val, dims=[0])            # ***dim=0***
             suffix_max_rev, _ = torch.cummax(reversed_vals, dim=0) # ***dim=0***
+            # NOTE: 复用后缀最大值作为约束分支的 epigraph 目标。
             c_max = torch.flip(suffix_max_rev, dims=[0]).view(B, -1)   # [B, N] / [B, 1]
 
             # Step 2: predictions
@@ -461,7 +473,9 @@ class epi_agent_new:
             V_ret = self.value_nets[i](x_t)  # return value
 
             # Sample z and compute z(t)
+            # NOTE: z* 选择当前激活的 epigraph 层级，满足 V_tilde(x,z*) = max(V_cons, V_ret-z*)。
             z_star = self.compute_z_star(x_t, i).view(B, 1)         # [B, 1]
+            # NOTE: epigraph 值函数中的回报分支。
             value_ret =  V_ret - z_star                             # [B, 1]
 
             # Mask: route gradients to the active branch
@@ -469,8 +483,10 @@ class epi_agent_new:
             mask_cons = 1.0 - mask_ret                              # [B,1]
             ratio = mask_ret.mean().item()                          # selection ratio
 
+            # NOTE: epigraph 辅助值通过逐点最大值合并约束分支和回报分支。
             epigraph_pred = torch.max(V_cons, V_ret - z_star)        # [B,1]
             S = epigraph_pred.sum()
+            # NOTE: HJB 残差需要 epigraph 值函数对状态的梯度。
             grad_x = torch.autograd.grad(
                 outputs=S,
                 inputs=x_t,
@@ -486,6 +502,7 @@ class epi_agent_new:
                 z_star = self.compute_z_star(x_t, i)                # [B,1] typically detached
 
                 # Branch selection: 1 selects Vl - z, 0 selects Vh
+                # NOTE: 激活分支掩码决定残差中的 partial_z V_tilde。
                 mask_val = (Vl - z_star > Vh).float()               # [B,1]
                 # grad_z: return branch is -1, constraint branch is 0
                 grad_z = -mask_val                                  # [B,1] (no grad)
@@ -494,15 +511,21 @@ class epi_agent_new:
             if grad_x is None:
                 grad_x = torch.zeros_like(x_t)
 
+            # NOTE: 使用 rollout 有限差分作为局部连续时间动力学 f(x,u)。
             f_xt = (x_tp1 - x_t) / dtss
+            # NOTE: Hamiltonian 中的传输项 grad_x V_tilde · f(x,u)。
             H_term = (grad_x * f_xt).sum(dim=1, keepdim=True)       # [B,1]
+            # NOTE: 辅助状态项为 partial_z V_tilde 与运行代价的乘积。
             z_term = grad_z * l_c
+            # NOTE: 无限时域折扣项 ln(gamma) * V_tilde。
             gamma_term = log_gamma * epigraph_pred                  # [B,1]
 
+            # NOTE: epigraph HJB 残差同时约束安全占优条件和 PDE 一致性。
             residual = torch.max(
                 c_max - epigraph_pred,
                 H_term - z_term + gamma_term
             )                                                       # [B,1]
+            # NOTE: epigraph critic 的 PINN 残差损失。
             loss_HJB = (residual ** 2).mean()
 
             # Clear both optimizers
@@ -538,6 +561,7 @@ class epi_agent_new:
             c_val = c_vals[:, i].view(B, -1)                                       # [B,1] for agent i
             per_return = int_returns[:, i].view(B, -1)                             # [B,1] for agent i
 
+            # NOTE: 下一步 z* 用于在 x_{t+dt} 处构造 VGI 目标。
             z_t_next = self.compute_z_star(x_tp1, i).view(B, 1)                    # [B, 1]
 
             # Step 2: predictions
@@ -549,6 +573,7 @@ class epi_agent_new:
                 z_star = self.compute_z_star(x_t, i)                              # [B,1] typically detached
 
                 # Branch selection: 1 selects Vl - z, 0 selects Vh
+                # NOTE: VGI 使用与残差和 actor 相同的 epigraph 激活分支掩码。
                 mask_val = (Vl - z_star > Vh).float()                             # [B,1]
                 # grad_z: return branch is -1, constraint branch is 0
                 grad_z = -mask_val                                                # [B,1] (no grad)
@@ -557,21 +582,26 @@ class epi_agent_new:
 
             v_cons = self.cost_nets[i](x_t)
             v_ret  = self.value_nets[i](x_t)
+            # NOTE: 用于值梯度匹配的当前 epigraph 值。
             v_tilde = torch.max(v_cons, v_ret - z_star.view(B,1))                 # element-wise max
 
+            # NOTE: VGI 左端项：学习到的梯度 nabla_x V_tilde(x_t)。
             grad_v_x = torch.autograd.grad(
                 v_tilde.sum(), x_t, create_graph=True, retain_graph=True
             )[0]                                                                  # [B, N*D]
 
             # Update VGI loss
+            # NOTE: 学习到的运行代价模型提供 nabla_x l(x,u)。
             r_hat     = self.reward_nets[i](x_t, u_t, dtss).view(B, 1)            # (-cost)
             grad_r_x  = torch.autograd.grad(r_hat.sum(), x_t, create_graph=True)[0]   # (B, N*D)
 
+            # NOTE: 学习到的即时约束模型提供 nabla_x c(x,u)。
             c_x       = self.single_cost_net[i](x_t, u_t, dtss)                   # (B,1)
             grad_c_x  = torch.autograd.grad(c_x.sum(), x_t, create_graph=True)[0] # (B, N*D)
 
             # Use mask to select: no violation -> grad_r_x; violation -> grad_c_x
             mask_val_exp = mask_val.expand_as(grad_r_x)                           # [B,ND]
+            # NOTE: 根据激活的 epigraph 分支选择代价梯度。
             grad_rc_x = mask_val_exp * grad_r_x + (1.0 - mask_val_exp) * grad_c_x # [B,ND]
             grad_rc_x = -grad_rc_x.view(B, -1)
 
@@ -579,14 +609,18 @@ class epi_agent_new:
             x_tp1_d   = x_tp1.clone().detach().requires_grad_(True)
             v_cons_n  = self.cost_nets[i](x_tp1_d)
             v_ret_n   = self.value_nets[i](x_tp1_d)
+            # NOTE: 下一步 epigraph 值用于反传目标梯度。
             v_tilde_n = torch.max(v_cons_n, v_ret_n - z_t_next.view(B,1))
 
+            # NOTE: 下一步 epigraph 值对状态的梯度 nabla_x V_tilde(x_{t+dt})。
             grad_v_x_n = torch.autograd.grad(v_tilde_n.sum(), x_tp1_d, create_graph=True)[0]  # (B,N*D)
 
             # dynamics Jacobian-vector product via autograd
             x_t_dyn = x_t.clone().detach().requires_grad_(True)
             x_t_next = self.dynamics_nets[i](x_t_dyn, u_t, dtss)
+            # NOTE: 由预测下一状态得到学习到的连续时间动力学 f_theta(x,u)。
             f_pred = (x_t_next - x_t_dyn) / dtss
+            # NOTE: 雅可比向量积将 nabla_x f 作用到下一步值梯度上。
             Jt_v = torch.autograd.grad(
                 outputs=f_pred,
                 inputs=x_t_dyn,
@@ -594,9 +628,12 @@ class epi_agent_new:
                 retain_graph=True, create_graph=True
             )[0]                                                                  # (B, D)
 
+            # NOTE: VGI 目标中的不规则步长折扣 gamma^dt。
             gamma_dt  = torch.exp(log_gamma * dtss)
+            # NOTE: VGI 目标梯度结合阶段代价梯度和折扣后的动力学拉回项。
             g_hat_vec = grad_rc_x * dtss + gamma_dt * Jt_v
 
+            # NOTE: VGI 损失使学习到的值梯度匹配传播得到的目标梯度。
             vgi_loss  = ((grad_v_x - g_hat_vec).pow(2)).mean()
 
             self.cost_optimizers[i].zero_grad()
@@ -625,7 +662,9 @@ class epi_agent_new:
             u_t = actions.view(B, -1)                      # [B, N*A]
             cost = costs[:,i]
             dt = dt.view(B, -1)
+            # NOTE: 学习到的奖赏/代价模型 l_hat(x,u,dt)，供残差、VGI 和 actor 使用。
             r_hat = self.reward_nets[i](x_t, u_t, dt).squeeze()  # [B, N] or [B]
+            # NOTE: 将任务运行代价拟合为环境奖赏的相反数。
             loss = nn.MSELoss()(r_hat, cost)
 
             self.reward_optimizers[i].zero_grad()
@@ -667,18 +706,24 @@ class epi_agent_new:
             with torch.no_grad():
                 Vh = self.cost_nets[i](x_flat)                  # [B,1]
                 Vl = self.value_nets[i](x_flat)                 # [B,1]
+                # NOTE: actor 更新使用 z* 评估当前 epigraph 分支。
                 z_star   = self.compute_z_star(x_flat, i).detach()  # [B,1]
 
             # Branch selection
+            # NOTE: 激活分支掩码控制 actor 跟随回报梯度还是约束梯度。
             mask = (Vl - z_star > Vh).float()                    # 1 selects value branch, 0 selects constraint branch
+            # NOTE: Hamiltonian 中使用的 epigraph 值。
             V_tilde = torch.max(Vh, Vl - z_star)
 
             # px via autograd
             x_req = x_flat.clone().detach().requires_grad_(True)
+            # NOTE: 只让 actor 梯度通过当前激活的 epigraph 分支。
             V_tilde_for_grad = torch.where(mask>0.5, (self.value_nets[i](x_req)-z_star), self.cost_nets[i](x_req))
+            # NOTE: 用于最小化 Hamiltonian 的协态 p_x = nabla_x V_tilde。
             px = torch.autograd.grad(V_tilde_for_grad.sum(), x_req, create_graph=False, retain_graph=False)[0].detach()
 
             # pz logic: value-branch=-1, constraint-branch=0
+            # NOTE: 协态 p_z = partial_z V_tilde；只有回报分支依赖 z。
             pz = -mask                                           # [B,1]
             con_mask = (1.0 - mask)                               # [B,1] constraint branch mask
 
@@ -695,19 +740,24 @@ class epi_agent_new:
             # 3) Build f(x,u) and l_c(x,u)
             # dynamics_nets predicts x_{t+1}, so f ≈ (x_next_pred - x)/dt
             x_next_pred = self.dynamics_nets[i](x_flat, whole_actions, dt).view(B, -1)  # [B, N*D]
+            # NOTE: actor 的 Hamiltonian 使用学习到的连续时间动力学 f_hat。
             f_hat = (x_next_pred - x_flat) / dt                                         # [B, N*D]
 
             # reward_nets target is (-reward) = l_c (performance cost)
+            # NOTE: 任务运行代价估计 l_c(x,u)。
             l_c_hat = self.reward_nets[i](x_flat, whole_actions, dt).view(B, 1)         # [B,1]
+            # NOTE: 即时约束估计 c(x,u) 在约束分支中生效。
             con_hat = self.single_cost_net[i](x_flat, whole_actions, dt).view(B, 1)     # [B,1] constraint cost
 
             # 4) Hamiltonian & actor loss
             # H = px^T f - pz * ( l_c + ln(gamma)*z )
             monitor1 = (px * f_hat).sum(dim=1, keepdim=True)                             # [B,1]
             monitor2 = -pz * l_c_hat                                                     # [B,1]
+            # NOTE: 去中心化 actor 最小化的 epigraph Hamiltonian。
             H = (px * f_hat).sum(dim=1, keepdim=True) - pz * l_c_hat + con_hat*con_mask + log_gamma * V_tilde  # [B,1]
 
             # Weight by dt (discrete approximation of integral)
+            # NOTE: actor 目标是不规则 dt 样本上的时间加权 Hamiltonian。
             actor_loss = (H*dt).mean()
             self.policy_optimizers[i].zero_grad()
             self.policy_nets[i].zero_grad()
