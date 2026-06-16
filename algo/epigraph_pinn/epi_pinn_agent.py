@@ -233,21 +233,42 @@ class epi_agent_new:
             print("Model files not found, skipping load.")
 
     def save_model(self, episode):
-        save_dir = os.path.join("trained_model", str(self.args.scenario), str(self.args.algo))
+        save_dir = getattr(
+            self.args,
+            "checkpoint_dir",
+            os.path.join("trained_model", str(self.args.scenario), str(self.args.algo)),
+        )
         os.makedirs(save_dir, exist_ok=True)   # create all parent directories automatically
+        saved_paths = set()
 
-        for i in range(self.n_agents):
-            torch.save(
-                self.policy_nets[i],
-                os.path.join(save_dir, f'policy_net[{i}]_{self.args.seed}_{episode}.pth')
-            )
+        path = os.path.join(save_dir, f'policy_nets_{self.args.seed}_{episode}.pth')
+        torch.save(self.policy_nets, path)
+        saved_paths.add(os.path.abspath(path))
 
-        torch.save(self.value_nets,
-                os.path.join(save_dir, f'value_nets_{self.args.seed}_{episode}.pth'))
-        torch.save(self.dynamics_nets,
-                os.path.join(save_dir, f'dynamics_nets_{self.args.seed}_{episode}.pth'))
-        torch.save(self.reward_nets,
-                os.path.join(save_dir, f'reward_nets_{self.args.seed}_{episode}.pth'))
+        path = os.path.join(save_dir, f'return_value_nets_{self.args.seed}_{episode}.pth')
+        torch.save(self.value_nets, path)
+        saved_paths.add(os.path.abspath(path))
+
+        path = os.path.join(save_dir, f'constraint_value_nets_{self.args.seed}_{episode}.pth')
+        torch.save(self.cost_nets, path)
+        saved_paths.add(os.path.abspath(path))
+
+        path = os.path.join(save_dir, f'dynamics_nets_{self.args.seed}_{episode}.pth')
+        torch.save(self.dynamics_nets, path)
+        saved_paths.add(os.path.abspath(path))
+
+        path = os.path.join(save_dir, f'reward_nets_{self.args.seed}_{episode}.pth')
+        torch.save(self.reward_nets, path)
+        saved_paths.add(os.path.abspath(path))
+
+        path = os.path.join(save_dir, f'constraint_model_nets_{self.args.seed}_{episode}.pth')
+        torch.save(self.single_cost_net, path)
+        saved_paths.add(os.path.abspath(path))
+
+        for filename in os.listdir(save_dir):
+            path = os.path.abspath(os.path.join(save_dir, filename))
+            if filename.endswith(".pth") and path not in saved_paths:
+                os.remove(path)
 
     def update(self, batch):
         dynamics_loss = self.dynamics_training(batch)
@@ -298,10 +319,15 @@ class epi_agent_new:
 
             mean = self.policy_nets[i](sb).squeeze(0)  # [action_dim]
 
-            dist = MultivariateNormal(mean.view(-1), covariance_matrix=self.cov_matrix)
             if self.args.mode == 'eval':
                 act = mean
             else:
+                cov_matrix = torch.eye(
+                    self.n_actions,
+                    dtype=mean.dtype,
+                    device=mean.device,
+                ) * (self._sigma_scale ** 2)
+                dist = MultivariateNormal(mean.view(-1), covariance_matrix=cov_matrix)
                 act = dist.rsample()
             act = torch.clamp(act, -1.0, 1.0)
 

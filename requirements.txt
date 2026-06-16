@@ -2,3 +2,4 @@ torch>=1.10.0
 numpy>=1.23.0
 gym==0.10.5
 wandb
+imageio[ffmpeg]

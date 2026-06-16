@@ -1,0 +1,1 @@
+python main.py --algo epi --scenario formation --use-wandb --seed 0 --eval-video
