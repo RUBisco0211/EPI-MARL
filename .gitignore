@@ -3,6 +3,5 @@
 *.pyc
 *.pyi
 trained_model
-papers
 runs
 .DS_Store
