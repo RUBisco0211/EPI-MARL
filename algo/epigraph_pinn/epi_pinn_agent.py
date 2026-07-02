@@ -319,15 +319,10 @@ class epi_agent_new:
 
             mean = self.policy_nets[i](sb).squeeze(0)  # [action_dim]
 
+            dist = MultivariateNormal(mean.view(-1), covariance_matrix=self.cov_matrix)
             if self.args.mode == 'eval':
                 act = mean
             else:
-                cov_matrix = torch.eye(
-                    self.n_actions,
-                    dtype=mean.dtype,
-                    device=mean.device,
-                ) * (self._sigma_scale ** 2)
-                dist = MultivariateNormal(mean.view(-1), covariance_matrix=cov_matrix)
                 act = dist.rsample()
             act = torch.clamp(act, -1.0, 1.0)
 
